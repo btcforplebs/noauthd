@@ -6,6 +6,7 @@ const {
   NDKRelay,
   NDKPrivateKeySigner,
   NDKNip46Backend,
+  NDKEvent,
 } = require("@nostr-dev-kit/ndk");
 const { createHash } = require("node:crypto");
 const express = require("express");
@@ -17,6 +18,7 @@ const {
   getCreateAccountToken,
 } = require("./crypto");
 const { PrismaClient } = require("@prisma/client");
+const { Nip44 } = require("./nip44");
 
 global.crypto = require("node:crypto");
 
@@ -29,9 +31,12 @@ const BUNKER_NSEC = process.env.BUNKER_NSEC;
 const BUNKER_RELAY = process.env.BUNKER_RELAY;
 const BUNKER_ORIGIN = process.env.BUNKER_ORIGIN;
 const BUNKER_DOMAIN = process.env.BUNKER_DOMAIN;
+const BUNKER_IFRAME_DOMAINS = (process.env.BUNKER_IFRAME_DOMAINS || "")
+  .split(",")
+  .filter((d) => !!d);
 
 // settings
-const port = 8000;
+const port = Number(process.env.PORT || 8000);
 const EMAIL = "artur@nostr.band"; // admin email
 const MAX_RELAYS = 3; // no more than 3 relays monitored per pubkey
 const MAX_BATCH_SIZE = 500; // pubkeys per sub
@@ -66,13 +71,7 @@ const ipNamePows = new Map();
 let bunkerSigner = null;
 
 async function push(psub) {
-  console.log(
-    new Date(),
-    "push for",
-    psub.pubkey,
-    "psub",
-    psub.id
-  );
+  console.log(new Date(), "push for", psub.pubkey, "psub", psub.id);
   try {
     const r = await webpush.sendNotification(
       psub.pushSubscription,
@@ -143,14 +142,20 @@ function restartTimer(psub) {
   psub.timer = setTimeout(async () => {
     psub.timer = undefined;
 
-    const now = Date.now()
+    const now = Date.now();
 
     // we've been pushing already and it's not waking up,
     // so we won't bother pushing again to avoid
     // annoying the push server
     if (psub.nextPush > now) {
-      console.log(new Date(), "skip push for", psub.pubkey, "until", new Date(psub.nextPush));
-      return
+      console.log(
+        new Date(),
+        "skip push for",
+        psub.pubkey,
+        "until",
+        new Date(psub.nextPush)
+      );
+      return;
     }
 
     const ok = await push(psub);
@@ -166,7 +171,6 @@ function restartTimer(psub) {
 
     // schedule next push
     psub.nextPush = Date.now() + psub.backoffMs;
-
   }, MIN_PAUSE);
 }
 
@@ -211,13 +215,7 @@ function processReply(r, e) {
 }
 
 function unsubscribeFromRelay(psub, relayUrl) {
-  console.log(
-    "unsubscribeFromRelay",
-    psub.id,
-    psub.pubkey,
-    "from",
-    relayUrl
-  );
+  console.log("unsubscribeFromRelay", psub.id, psub.pubkey, "from", relayUrl);
 
   // remove from global pubkey+relay=psub table
   const pr = psub.pubkey + relayUrl;
@@ -549,7 +547,7 @@ async function addPsub(id, pubkey, pushSubscription, relays) {
       timer: undefined,
       backoffMs: 0,
       lastPush: 0,
-      nextPush: 0
+      nextPush: 0,
     };
 
     console.log(new Date(), "sub created", pubkey, psub, relays);
@@ -993,14 +991,20 @@ app.get(JSON_PATH, async (req, res) => {
     const { data: bunkerNsec } = nip19.decode(BUNKER_NSEC);
     const bunkerPubkey = getPublicKey(bunkerNsec);
 
+    const dc = BUNKER_IFRAME_DOMAINS.length;
+    const iframe_domain = dc
+      ? BUNKER_IFRAME_DOMAINS[Math.floor(Math.random() * dc)]
+      : new URL(BUNKER_ORIGIN).hostname;
     const data = {
       names: {
         _: bunkerPubkey,
       },
       nip46: {
-        iframe_url: BUNKER_ORIGIN+"/iframe",
+        iframe_url: `https://${iframe_domain}/iframe`,
+        relays: [BUNKER_RELAY],
+        nostrconnect_url: `${BUNKER_ORIGIN}/<nostrconnect>`,
       },
-      // FIXME remove when ndk is fixed
+      // old ndk fails without it
       relays: {},
     };
     data.nip46[bunkerPubkey] = [BUNKER_RELAY];
@@ -1140,7 +1144,7 @@ class CreateAccountHandlingStrategy {
     // format auth url
     const url = `${BUNKER_ORIGIN}/create?name=${name}&token=${token}&appNpub=${appNpub}&perms=${perms}&email=${email}`;
     console.log("sending auth_url", url, "to", remotePubkey);
-    await backend.rpc.sendResponse(
+    await backend.sendResponse(
       id,
       remotePubkey,
       "auth_url",
@@ -1170,18 +1174,104 @@ class CreateAccountHandlingStrategy {
   }
 }
 
-// copycat of ndk's implementations with one exception:
-// it ignores the unknown methods (except create_account)
+class PrivateKeySigner extends NDKPrivateKeySigner {
+  nip44 = new Nip44();
+  _pubkey = '';
+
+  constructor(privateKey) {
+    super(privateKey);
+    this._pubkey = getPublicKey(privateKey);
+  }
+
+  get pubkey() {
+    return this._pubkey;
+  }
+
+  encryptNip44(recipient, value) {
+    return Promise.resolve(this.nip44.encrypt(this.privateKey, recipient.pubkey, value));
+  }
+
+  decryptNip44(sender, value) {
+    return Promise.resolve(this.nip44.decrypt(this.privateKey, sender.pubkey, value));
+  }
+}
+
 class Nip46Backend extends NDKNip46Backend {
+  _signer = undefined;
+
   constructor(ndk, signer) {
     super(ndk, signer, () => Promise.resolve(true));
     signer.user().then((u) => (this.npub = nip19.npubEncode(u.pubkey)));
+    this._signer = signer;
+  }
+
+  isNip04(ciphertext) {
+    const l = ciphertext.length;
+    if (l < 28) return false;
+    return ciphertext[l - 28] === '?' && ciphertext[l - 27] === 'i' && ciphertext[l - 26] === 'v' && ciphertext[l - 25] === '=';
+  }
+
+  async parseEvent(event) {
+    const remoteUser = this.ndk.getUser({ pubkey: event.pubkey });
+    remoteUser.ndk = this.ndk;
+    const decrypt = this.isNip04(event.content)
+      ? this._signer.decrypt
+      : this._signer.decryptNip44;
+    console.log("client event nip04", this.isNip04(event.content));
+    const decryptedContent = await decrypt.call(
+      this._signer,
+      remoteUser,
+      event.content
+    );
+    const parsedContent = JSON.parse(decryptedContent);
+    const { id, method, params, result, error } = parsedContent;
+
+    if (method) {
+      return { id, pubkey: event.pubkey, method, params, event };
+    } else {
+      return { id, result, error, event };
+    }
+  }
+
+  async sendResponse(
+    id,
+    remotePubkey,
+    result,
+    kind = 24133,
+    error
+  ) {
+    const res = { id, result }
+    if (error) {
+      res.error = error
+    }
+
+    const localUser = await this.signer.user()
+    const remoteUser = this.ndk.getUser({ pubkey: remotePubkey })
+    const event = new NDKEvent(this.ndk, {
+      kind,
+      content: JSON.stringify(res),
+      tags: [['p', remotePubkey]],
+      pubkey: localUser.pubkey,
+    })
+
+    event.content = await this._signer.encryptNip44(remoteUser, event.content)
+    await event.sign(this._signer)
+    await event.publish();
+    return event
   }
 
   async handleIncomingEvent(event) {
     if (event.created_at < Date.now() / 1000 - 10) return;
 
-    const { id, method, params } = await this.rpc.parseEvent(event);
+    let req;
+    try {
+      req = await this.parseEvent(event);
+    } catch (e) {
+      this.debug("failed to parse event", event.rawEvent(), e);
+      // ignore unsupported methods
+      return;
+    }
+    const { id, method, params } = req;
     const remotePubkey = event.pubkey;
     let response;
 
@@ -1206,7 +1296,7 @@ class Nip46Backend extends NDKNip46Backend {
         );
       } catch (e) {
         this.debug("error handling event", e, { id, method, params });
-        this.rpc.sendResponse(id, remotePubkey, "error", undefined, e.message);
+        this.sendResponse(id, remotePubkey, "error", undefined, e.message);
       }
     } else {
       this.debug("unsupported method", { method, params });
@@ -1216,9 +1306,9 @@ class Nip46Backend extends NDKNip46Backend {
 
     if (response) {
       this.debug(`sending response to ${remotePubkey}`, response);
-      this.rpc.sendResponse(id, remotePubkey, response);
+      this.sendResponse(id, remotePubkey, response);
     } else {
-      this.rpc.sendResponse(
+      this.sendResponse(
         id,
         remotePubkey,
         "error",
@@ -1233,10 +1323,11 @@ async function startBunker() {
   const { data: bunkerSk } = nip19.decode(BUNKER_NSEC);
   bunkerSigner = new Nip46Backend(
     ndk,
-    new NDKPrivateKeySigner(bunkerSk),
+    new PrivateKeySigner(bunkerSk),
     () => true
   );
   bunkerSigner.handlers = {
+    get_public_key: bunkerSigner.handlers.get_public_key,
     create_account: new CreateAccountHandlingStrategy(),
   };
   bunkerSigner.start();
