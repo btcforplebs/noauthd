@@ -12,7 +12,7 @@ global.crypto = require("node:crypto");
 
 const ndk = new NDK({
   enableOutboxModel: false,
-  explicitRelayUrls: ["wss://relay.nsec.app"],
+  explicitRelayUrls: ["wss://relay.btcforplebs.com"],
 });
 
 const LOCAL = true;
@@ -148,7 +148,7 @@ signer.on("authUrl", async (url) => {
     method: "POST",
     url: LOCAL
       ? "http://localhost:8000/created"
-      : "https://noauthd.nsec.app/created",
+      : "https://noauthd.btcforplebs.com/created",
     body: JSON.stringify({
       npub: nip19.npubEncode(getPublicKey(sk)),
       token,
@@ -170,7 +170,7 @@ if (process.argv.length >= 3) {
         method: "POST",
         url: LOCAL
           ? "http://localhost:8000/name"
-          : "https://noauthd.nsec.app/name",
+          : "https://noauthd.btcforplebs.com/name",
         body: JSON.stringify({
           npub,
           name,
@@ -183,7 +183,7 @@ if (process.argv.length >= 3) {
         method: "PUT",
         url: LOCAL
           ? "http://localhost:8000/name"
-          : "https://noauthd.nsec.app/name",
+          : "https://noauthd.btcforplebs.com/name",
         body: JSON.stringify({
           npub,
           name: name,
@@ -196,7 +196,7 @@ if (process.argv.length >= 3) {
         method: "POST",
         url: LOCAL
           ? "http://localhost:8000/name"
-          : "https://noauthd.nsec.app/name",
+          : "https://noauthd.btcforplebs.com/name",
         body: JSON.stringify({
           npub: npub1,
           name,
@@ -208,7 +208,7 @@ if (process.argv.length >= 3) {
       //   method: "DELETE",
       //   url: LOCAL
       //     ? "http://localhost:8000/name"
-      //     : "https://noauthd.nsec.app/name",
+      //     : "https://noauthd.btcforplebs.com/name",
       //   body: JSON.stringify({
       //     npub: npub1,
       //     name: name,
@@ -221,7 +221,7 @@ if (process.argv.length >= 3) {
 } else {
   const params = [
     "test",
-    "nsec.app",
+    "btcforplebs.com",
     "",
     "sign_event:4"
     // email?
